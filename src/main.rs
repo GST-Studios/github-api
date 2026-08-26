@@ -5,6 +5,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, env, net::SocketAddr, sync::Arc};
@@ -91,6 +92,14 @@ async fn main() {
         .route("/v1/users/:username", get(fetch_user))
         .route("/v1/users/:username/avatar", get(fetch_avatar))
         .route("/v1/users/:username/repos", get(fetch_repositories))
+        .route(
+            "/v1/users/:username/repositories",
+            get(fetch_repository_links),
+        )
+        .route(
+            "/v1/users/:username/repos/:repo/tree",
+            get(fetch_repository_tree),
+        )
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
@@ -300,14 +309,9 @@ async fn fetch_repositories(
         return error_response(StatusCode::BAD_REQUEST, "invalid GitHub username");
     }
 
-    let token = match state.linked_accounts.read().await.get(username).cloned() {
-        Some(token) => token,
-        None => {
-            return error_response(
-                StatusCode::FORBIDDEN,
-                "connect this GitHub account before reading its repositories",
-            )
-        }
+    let token = match connected_token(&state, username).await {
+        Ok(token) => token,
+        Err(response) => return response,
     };
 
     match state
@@ -327,6 +331,140 @@ async fn fetch_repositories(
         ),
         _ => error_response(StatusCode::BAD_GATEWAY, "could not fetch GitHub repositories"),
     }
+}
+
+async fn fetch_repository_links(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(username): Path<String>,
+) -> Response {
+    if !authorized(&headers, &state.api_keys) {
+        return error_response(StatusCode::UNAUTHORIZED, "missing or invalid X-API-Key");
+    }
+
+    let username = username.trim();
+    if username.is_empty() || username.len() > 39 {
+        return error_response(StatusCode::BAD_REQUEST, "invalid GitHub username");
+    }
+
+    let token = match connected_token(&state, username).await {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+
+    match state
+        .client
+        .get("https://api.github.com/user/repos?visibility=all&affiliation=owner%2Ccollaborator%2Corganization_member&per_page=100")
+        .bearer_auth(token)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            match response.json::<Vec<serde_json::Value>>().await {
+                Ok(repositories) => {
+                    let links = repositories
+                        .into_iter()
+                        .filter_map(|repository| {
+                            Some(serde_json::json!({
+                                "name": repository.get("full_name")?.as_str()?,
+                                "link": repository.get("html_url")?.as_str()?,
+                            }))
+                        })
+                        .collect::<Vec<_>>();
+                    Json(links).into_response()
+                }
+                Err(_) => error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid GitHub repositories response",
+                ),
+            }
+        }
+        _ => error_response(StatusCode::BAD_GATEWAY, "could not fetch GitHub repositories"),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TreeQuery {
+    branch: Option<String>,
+}
+
+async fn fetch_repository_tree(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((username, repo)): Path<(String, String)>,
+    Query(query): Query<TreeQuery>,
+) -> Response {
+    if !authorized(&headers, &state.api_keys) {
+        return error_response(StatusCode::UNAUTHORIZED, "missing or invalid X-API-Key");
+    }
+
+    let username = username.trim();
+    let repo = repo.trim();
+    if username.is_empty() || username.len() > 39 || repo.is_empty() || repo.len() > 100 {
+        return error_response(StatusCode::BAD_REQUEST, "invalid GitHub repository path");
+    }
+
+    let token = match connected_token(&state, username).await {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let branch = query.branch.unwrap_or_else(|| "HEAD".to_owned());
+    let tree_url = format!(
+        "https://api.github.com/repos/{username}/{repo}/git/trees/{}?recursive=1",
+        encode_path(&branch)
+    );
+
+    match state.client.get(tree_url).bearer_auth(token).send().await {
+        Ok(response) if response.status().is_success() => {
+            match response.json::<serde_json::Value>().await {
+                Ok(tree) => {
+                    let entries = tree
+                        .get("tree")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| {
+                                    let path = item.get("path")?.as_str()?;
+                                    let kind = item.get("type")?.as_str()?;
+                                    let object = if kind == "tree" { "tree" } else { "blob" };
+                                    Some(serde_json::json!({
+                                        "name": path,
+                                        "link": format!("https://github.com/{username}/{repo}/{object}/{branch}/{path}"),
+                                    }))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    Json(entries).into_response()
+                }
+                Err(_) => error_response(StatusCode::BAD_GATEWAY, "invalid GitHub tree response"),
+            }
+        }
+        Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => error_response(
+            StatusCode::NOT_FOUND,
+            "GitHub repository or branch not found",
+        ),
+        _ => error_response(
+            StatusCode::BAD_GATEWAY,
+            "could not fetch GitHub repository tree",
+        ),
+    }
+}
+
+async fn connected_token(state: &AppState, username: &str) -> Result<String, Response> {
+    state
+        .linked_accounts
+        .read()
+        .await
+        .get(username)
+        .cloned()
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::FORBIDDEN,
+                "connect this GitHub account before reading its repositories",
+            )
+        })
 }
 
 async fn github_user(client: &Client, username: &str) -> Result<GithubUser, Response> {
@@ -363,6 +501,10 @@ fn authorized(headers: &HeaderMap, api_keys: &[String]) -> bool {
 
 fn encode(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+fn encode_path(value: &str) -> String {
+    utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {

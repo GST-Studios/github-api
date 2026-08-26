@@ -249,6 +249,7 @@ dependencies = [
  "axum",
  "base64",
  "dotenvy",
+ "percent-encoding",
  "reqwest",
  "serde",
  "serde_json",

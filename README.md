@@ -8,6 +8,8 @@ A small read-only Rust API that lets a user connect a GitHub account with OAuth,
 - API-key-protected complete public profile reads at `GET /v1/users/{username}`.
 - API-key-protected avatar reads at `GET /v1/users/{username}/avatar`.
 - API-key-protected repository reads at `GET /v1/users/{username}/repos`, including private repositories the connected account can access.
+- Repository name/link reads at `GET /v1/users/{username}/repositories`.
+- Recursive file/folder name/link reads at `GET /v1/users/{username}/repos/{repo}/tree`.
 - No write routes to GitHub and no editing permissions requested.
 - In-memory OAuth state and linked-account storage for the starter project.
 
@@ -50,6 +52,20 @@ curl.exe -H "X-API-Key: replace-with-a-long-random-key" `
 ```
 
 The repository endpoint uses the connected account's OAuth token and returns only data from GitHub's read API. The API never creates, updates, deletes, or pushes to repositories.
+
+List only repository names and links:
+
+```powershell
+curl.exe -H "X-API-Key: replace-with-a-long-random-key" `
+  http://127.0.0.1:3000/v1/users/MICKYcyber/repositories
+```
+
+List every file and folder name and its GitHub link. Add `?branch=main` to choose a branch; otherwise GitHub's default branch is used:
+
+```powershell
+curl.exe -H "X-API-Key: replace-with-a-long-random-key" `
+  "http://127.0.0.1:3000/v1/users/MICKYcyber/repos/your-repository/tree?branch=main"
+```
 
 Check health:
 

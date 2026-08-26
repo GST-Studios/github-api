@@ -23,10 +23,12 @@ struct AppState {
     linked_accounts: Arc<RwLock<HashMap<String, String>>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct GithubUser {
     login: String,
     avatar_url: String,
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,7 +88,9 @@ async fn main() {
         .route("/health", get(health))
         .route("/oauth/github/start", get(github_start))
         .route("/oauth/github/callback", get(github_callback))
+        .route("/v1/users/:username", get(fetch_user))
         .route("/v1/users/:username/avatar", get(fetch_avatar))
+        .route("/v1/users/:username/repos", get(fetch_repositories))
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
@@ -128,7 +132,7 @@ async fn github_start(State(state): State<AppState>) -> Response {
         .insert(state_token.clone(), "pending".to_owned());
 
     let query = format!(
-        "client_id={}&redirect_uri={}&scope=read:user&state={}",
+        "client_id={}&redirect_uri={}&scope=read%3Auser%20repo&state={}",
         encode(&state.github_client_id),
         encode(&state.github_redirect_uri),
         encode(&state_token)
@@ -231,23 +235,9 @@ async fn fetch_avatar(
         return error_response(StatusCode::BAD_REQUEST, "invalid GitHub username");
     }
 
-    let github_user = match state
-        .client
-        .get(format!("https://api.github.com/users/{username}"))
-        .send()
-        .await
-    {
-        Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
-            return error_response(StatusCode::NOT_FOUND, "GitHub user not found")
-        }
-        Ok(response) if response.status().is_success() => match response.json::<GithubUser>().await
-        {
-            Ok(user) => user,
-            Err(_) => {
-                return error_response(StatusCode::BAD_GATEWAY, "invalid GitHub user response")
-            }
-        },
-        _ => return error_response(StatusCode::BAD_GATEWAY, "could not reach GitHub"),
+    let github_user = match github_user(&state.client, username).await {
+        Ok(user) => user,
+        Err(response) => return response,
     };
 
     let image = match state.client.get(github_user.avatar_url).send().await {
@@ -274,6 +264,94 @@ async fn fetch_avatar(
         header::HeaderValue::from_static("public, max-age=300"),
     );
     response
+}
+
+async fn fetch_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(username): Path<String>,
+) -> Response {
+    if !authorized(&headers, &state.api_keys) {
+        return error_response(StatusCode::UNAUTHORIZED, "missing or invalid X-API-Key");
+    }
+
+    let username = username.trim();
+    if username.is_empty() || username.len() > 39 {
+        return error_response(StatusCode::BAD_REQUEST, "invalid GitHub username");
+    }
+
+    match github_user(&state.client, username).await {
+        Ok(user) => Json(user).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn fetch_repositories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(username): Path<String>,
+) -> Response {
+    if !authorized(&headers, &state.api_keys) {
+        return error_response(StatusCode::UNAUTHORIZED, "missing or invalid X-API-Key");
+    }
+
+    let username = username.trim();
+    if username.is_empty() || username.len() > 39 {
+        return error_response(StatusCode::BAD_REQUEST, "invalid GitHub username");
+    }
+
+    let token = match state.linked_accounts.read().await.get(username).cloned() {
+        Some(token) => token,
+        None => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "connect this GitHub account before reading its repositories",
+            )
+        }
+    };
+
+    match state
+        .client
+        .get("https://api.github.com/user/repos?visibility=all&affiliation=owner%2Ccollaborator%2Corganization_member&per_page=100")
+        .bearer_auth(token)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => match response.json::<serde_json::Value>().await {
+            Ok(repositories) => Json(repositories).into_response(),
+            Err(_) => error_response(StatusCode::BAD_GATEWAY, "invalid GitHub repositories response"),
+        },
+        Ok(response) if response.status() == reqwest::StatusCode::FORBIDDEN => error_response(
+            StatusCode::FORBIDDEN,
+            "GitHub denied repository access; reconnect with private repository permission",
+        ),
+        _ => error_response(StatusCode::BAD_GATEWAY, "could not fetch GitHub repositories"),
+    }
+}
+
+async fn github_user(client: &Client, username: &str) -> Result<GithubUser, Response> {
+    match client
+        .get(format!("https://api.github.com/users/{username}"))
+        .send()
+        .await
+    {
+        Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => Err(error_response(
+            StatusCode::NOT_FOUND,
+            "GitHub user not found",
+        )),
+        Ok(response) if response.status().is_success() => match response.json::<GithubUser>().await
+        {
+            Ok(user) => Ok(user),
+            Err(_) => Err(error_response(
+                StatusCode::BAD_GATEWAY,
+                "invalid GitHub user response",
+            )),
+        },
+        _ => Err(error_response(
+            StatusCode::BAD_GATEWAY,
+            "could not reach GitHub",
+        )),
+    }
 }
 
 fn authorized(headers: &HeaderMap, api_keys: &[String]) -> bool {

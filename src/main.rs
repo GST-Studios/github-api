@@ -8,7 +8,7 @@ use axum::{
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, env, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, env, fs, net::SocketAddr, path::Path as FilePath, sync::Arc};
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -20,6 +20,7 @@ struct AppState {
     github_client_id: String,
     github_client_secret: String,
     github_redirect_uri: String,
+    oauth_store_path: String,
     oauth_states: Arc<RwLock<HashMap<String, String>>>,
     linked_accounts: Arc<RwLock<HashMap<String, String>>>,
 }
@@ -81,8 +82,16 @@ async fn main() {
         github_client_id: required_env("GITHUB_CLIENT_ID"),
         github_client_secret: required_env("GITHUB_CLIENT_SECRET"),
         github_redirect_uri: required_env("GITHUB_REDIRECT_URI"),
+        oauth_store_path: env::var("OAUTH_STORE_PATH")
+            .unwrap_or_else(|_| ".oauth_tokens.json".to_owned()),
         oauth_states: Arc::new(RwLock::new(HashMap::new())),
         linked_accounts: Arc::new(RwLock::new(HashMap::new())),
+    };
+
+    let linked_accounts = load_linked_accounts(&state.oauth_store_path);
+    let state = AppState {
+        linked_accounts: Arc::new(RwLock::new(linked_accounts)),
+        ..state
     };
 
     let app = Router::new()
@@ -228,7 +237,13 @@ async fn github_callback(
         .linked_accounts
         .write()
         .await
-        .insert(github_user.login.clone(), token);
+        .insert(github_user.login.clone(), token.clone());
+    if let Err(error) = persist_linked_accounts(&state).await {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("GitHub connected but token could not be saved: {error}"),
+        );
+    }
 
     Json(serde_json::json!({
         "message": "GitHub account connected",
@@ -473,7 +488,13 @@ async fn fetch_repository_tree(
         Ok(token) => token,
         Err(response) => return response,
     };
-    let branch = query.branch.unwrap_or_else(|| "HEAD".to_owned());
+    let branch = match query.branch {
+        Some(branch) => branch,
+        None => match github_default_branch(&state.client, username, repo, &token).await {
+            Ok(branch) => branch,
+            Err(response) => return response,
+        },
+    };
     let tree_url = format!(
         "https://api.github.com/repos/{username}/{repo}/git/trees/{}?recursive=1",
         encode_path(&branch)
@@ -537,7 +558,13 @@ async fn fetch_organization_tree(
         Ok(token) => token,
         Err(response) => return response,
     };
-    let branch = query.branch.unwrap_or_else(|| "HEAD".to_owned());
+    let branch = match query.branch {
+        Some(branch) => branch,
+        None => match github_default_branch(&state.client, organization, repo, &token).await {
+            Ok(branch) => branch,
+            Err(response) => return response,
+        },
+    };
     let tree_url = format!(
         "https://api.github.com/repos/{organization}/{repo}/git/trees/{}?recursive=1",
         encode_path(&branch)
@@ -643,6 +670,67 @@ async fn connected_organization_token(
         StatusCode::FORBIDDEN,
         "connect a GitHub account that belongs to this organization before reading its repositories",
     ))
+}
+
+async fn github_default_branch(
+    client: &Client,
+    owner: &str,
+    repo: &str,
+    token: &str,
+) -> Result<String, Response> {
+    match client
+        .get(format!("https://api.github.com/repos/{owner}/{repo}"))
+        .bearer_auth(token)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            match response.json::<serde_json::Value>().await {
+                Ok(repository) => repository
+                    .get("default_branch")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| {
+                        error_response(
+                            StatusCode::BAD_GATEWAY,
+                            "GitHub did not return a default branch",
+                        )
+                    }),
+                Err(_) => Err(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid GitHub repository response",
+                )),
+            }
+        }
+        Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => Err(error_response(
+            StatusCode::NOT_FOUND,
+            "GitHub repository not found",
+        )),
+        _ => Err(error_response(
+            StatusCode::BAD_GATEWAY,
+            "could not fetch GitHub repository",
+        )),
+    }
+}
+
+fn load_linked_accounts(path: &str) -> HashMap<String, String> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+        .unwrap_or_default()
+}
+
+async fn persist_linked_accounts(state: &AppState) -> Result<(), String> {
+    let accounts = state.linked_accounts.read().await.clone();
+    let contents = serde_json::to_vec_pretty(&accounts).map_err(|error| error.to_string())?;
+    let path = FilePath::new(&state.oauth_store_path);
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(path, contents).map_err(|error| error.to_string())
 }
 
 async fn github_user(client: &Client, username: &str) -> Result<GithubUser, Response> {

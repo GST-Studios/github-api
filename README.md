@@ -86,4 +86,6 @@ curl.exe http://127.0.0.1:3000/health
 
 ## Production notes
 
-This starter keeps OAuth state and connections in memory, so use a database or shared cache before deploying multiple instances. The classic GitHub OAuth `repo` scope grants broad repository permissions to the token; the API itself only calls read endpoints. For least privilege in production, use a GitHub App with repository contents and metadata set to read-only. Store API keys as hashes with rotation and expiry, add rate limiting, and restrict image content types and response sizes if the endpoint will be public.
+OAuth tokens are saved in `.oauth_tokens.json` so the connection survives API restarts. This file is ignored by Git and should be protected like a credential. Set `OAUTH_STORE_PATH` to move it elsewhere. Reconnect only if the token is revoked or its permissions change.
+
+The classic GitHub OAuth `repo` scope grants broad repository permissions to the token; the API itself only calls read endpoints. For least privilege in production, use a GitHub App with repository contents and metadata set to read-only. Store API keys as hashes with rotation and expiry, add rate limiting, and restrict image content types and response sizes if the endpoint will be public.

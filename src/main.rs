@@ -396,8 +396,13 @@ async fn fetch_repository_links(
                     let links = repositories
                         .into_iter()
                         .filter_map(|repository| {
+                            let full_name = repository.get("full_name")?.as_str()?;
+                            let repository_owner = full_name.split('/').next()?;
+                            if !repository_owner.eq_ignore_ascii_case(username) {
+                                return None;
+                            }
                             Some(serde_json::json!({
-                                "name": repository.get("full_name")?.as_str()?,
+                                "name": full_name,
                                 "link": repository.get("html_url")?.as_str()?,
                             }))
                         })

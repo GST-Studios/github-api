@@ -117,6 +117,14 @@ async fn main() {
             "/v1/orgs/:organization/repos/:repo/tree",
             get(fetch_organization_tree),
         )
+        .route(
+            "/v1/users/:username/repos/:repo/file",
+            get(fetch_repository_file),
+        )
+        .route(
+            "/v1/orgs/:organization/repos/:repo/file",
+            get(fetch_organization_file),
+        )
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
@@ -571,6 +579,102 @@ async fn fetch_organization_tree(
     );
 
     fetch_tree_from_url(&state.client, token, tree_url, organization, repo, &branch).await
+}
+
+#[derive(Debug, Deserialize)]
+struct FileQuery {
+    path: String,
+}
+
+async fn fetch_repository_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((username, repo)): Path<(String, String)>,
+    Query(query): Query<FileQuery>,
+) -> Response {
+    fetch_file_for_owner(&state, &headers, &username, &repo, &query.path).await
+}
+
+async fn fetch_organization_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((organization, repo)): Path<(String, String)>,
+    Query(query): Query<FileQuery>,
+) -> Response {
+    fetch_file_for_owner(&state, &headers, &organization, &repo, &query.path).await
+}
+
+async fn fetch_file_for_owner(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    repo: &str,
+    path: &str,
+) -> Response {
+    if !authorized(headers, &state.api_keys) {
+        return error_response(StatusCode::UNAUTHORIZED, "missing or invalid X-API-Key");
+    }
+    if owner.is_empty() || repo.is_empty() || path.is_empty() || path.len() > 4096 {
+        return error_response(StatusCode::BAD_REQUEST, "invalid GitHub file path");
+    }
+
+    let token = match connected_owner_token(state, owner).await {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let api_url = format!(
+        "https://api.github.com/repos/{owner}/{repo}/contents/{}",
+        encode_path(path)
+    );
+
+    let content_url_result = match state.client.get(api_url).bearer_auth(&token).send().await {
+        Ok(response) if response.status().is_success() => match response
+            .json::<serde_json::Value>()
+            .await
+        {
+            Ok(file) if file.get("type").and_then(serde_json::Value::as_str) == Some("file") => {
+                file.get("download_url")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+            }
+            _ => None,
+        },
+        Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
+            return error_response(StatusCode::NOT_FOUND, "GitHub file not found")
+        }
+        _ => None,
+    };
+    let content_url = match content_url_result {
+        Some(url) => url,
+        None => return error_response(StatusCode::BAD_GATEWAY, "could not resolve GitHub file"),
+    };
+
+    match state
+        .client
+        .get(content_url)
+        .bearer_auth(token)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            let content_type = response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .cloned()
+                .unwrap_or_else(|| header::HeaderValue::from_static("application/octet-stream"));
+            match response.bytes().await {
+                Ok(bytes) => {
+                    let mut output = bytes.into_response();
+                    output
+                        .headers_mut()
+                        .insert(header::CONTENT_TYPE, content_type);
+                    output
+                }
+                Err(_) => error_response(StatusCode::BAD_GATEWAY, "could not read GitHub file"),
+            }
+        }
+        _ => error_response(StatusCode::BAD_GATEWAY, "could not download GitHub file"),
+    }
 }
 
 async fn fetch_tree_from_url(

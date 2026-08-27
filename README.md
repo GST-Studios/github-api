@@ -10,6 +10,8 @@ A small read-only Rust API that lets a user connect a GitHub account with OAuth,
 - API-key-protected repository reads at `GET /v1/users/{username}/repos`, including private repositories the connected account can access.
 - Repository name/link reads at `GET /v1/users/{username}/repositories`.
 - Recursive file/folder name/link reads at `GET /v1/users/{username}/repos/{repo}/tree`.
+- Organization repository reads at `GET /v1/orgs/{organization}/repositories`.
+- Organization file/folder reads at `GET /v1/orgs/{organization}/repos/{repo}/tree`.
 - No write routes to GitHub and no editing permissions requested.
 - In-memory OAuth state and linked-account storage for the starter project.
 
@@ -52,6 +54,15 @@ curl.exe -H "X-API-Key: replace-with-a-long-random-key" `
 ```
 
 The repository endpoint uses the connected account's OAuth token and returns only data from GitHub's read API. The API never creates, updates, deletes, or pushes to repositories.
+
+For an organization such as `GST-Studios`, the connected GitHub account must be a member of that organization. Use the organization routes so the API can verify membership and read repositories visible to that account:
+
+```powershell
+curl.exe -H "X-API-Key: replace-with-a-long-random-key" `
+  http://127.0.0.1:3000/v1/orgs/GST-Studios/repositories
+```
+
+The organization route returns `403` until a connected OAuth account is confirmed as an organization member.
 
 List only repository names and links:
 

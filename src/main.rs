@@ -332,7 +332,7 @@ async fn fetch_repositories(
         return error_response(StatusCode::BAD_REQUEST, "invalid GitHub username");
     }
 
-    let token = match connected_token(&state, username).await {
+    let token = match connected_owner_token(&state, username).await {
         Ok(token) => token,
         Err(response) => return response,
     };
@@ -370,7 +370,7 @@ async fn fetch_repository_links(
         return error_response(StatusCode::BAD_REQUEST, "invalid GitHub username");
     }
 
-    let token = match connected_token(&state, username).await {
+    let token = match connected_owner_token(&state, username).await {
         Ok(token) => token,
         Err(response) => return response,
     };
@@ -484,7 +484,7 @@ async fn fetch_repository_tree(
         return error_response(StatusCode::BAD_REQUEST, "invalid GitHub repository path");
     }
 
-    let token = match connected_token(&state, username).await {
+    let token = match connected_owner_token(&state, username).await {
         Ok(token) => token,
         Err(response) => return response,
     };
@@ -632,6 +632,14 @@ async fn connected_token(state: &AppState, username: &str) -> Result<String, Res
                 "connect this GitHub account before reading its repositories",
             )
         })
+}
+
+async fn connected_owner_token(state: &AppState, owner: &str) -> Result<String, Response> {
+    if let Ok(token) = connected_token(state, owner).await {
+        return Ok(token);
+    }
+
+    connected_organization_token(state, owner).await
 }
 
 async fn connected_organization_token(

@@ -352,8 +352,20 @@ async fn fetch_repositories(
         .send()
         .await
     {
-        Ok(response) if response.status().is_success() => match response.json::<serde_json::Value>().await {
-            Ok(repositories) => Json(repositories).into_response(),
+        Ok(response) if response.status().is_success() => match response.json::<Vec<serde_json::Value>>().await {
+            Ok(repositories) => {
+                let repositories = repositories
+                    .into_iter()
+                    .filter(|repository| {
+                        repository
+                            .get("owner")
+                            .and_then(|owner| owner.get("login"))
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|owner| owner.eq_ignore_ascii_case(username))
+                    })
+                    .collect::<Vec<_>>();
+                Json(repositories).into_response()
+            }
             Err(_) => error_response(StatusCode::BAD_GATEWAY, "invalid GitHub repositories response"),
         },
         Ok(response) if response.status() == reqwest::StatusCode::FORBIDDEN => error_response(
